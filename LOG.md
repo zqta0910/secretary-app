@@ -14,3 +14,13 @@
 - 詰まった点: Cursorで`.env.local`を開いたとき、サイドバーが別プロジェクト(household-app)のままで少し混乱した
   → ファイルタブ自体は正しいパスだったので実害なし。次は必要ならCursorで対象フォルダを開き直す。
   まだSupabase(memosテーブル)とは繋がっていない、次回はAIにメモの検索・編集をさせる「ツール」部分を実装する。
+
+## 2026-09-25
+- やったこと: GitHubにpush(zqta0910/secretary-app、publicに設定)。
+  Claudeに`search_memos`/`update_memo`ツールを実装し、実際にmemo-appのSupabaseデータを検索・編集できるようになった。
+  ストリーミング形式で「考えています…」「メモを検索しています…」の経過表示 + バウンドアニメーションを追加。
+  「メモを編集する」ボタンを、番号付きリストから選ぶ方式に改良(番号 or タイトル部分一致で選択 → 変更内容を聞く → Claudeへは確定したIDを渡す)。
+- 変更ファイル: src/app/api/chat/route.ts, src/components/ChatApp.tsx
+- 詰まった点: Supabase無料プランがAPI無操作で自動一時停止(Pause)していて`fetch failed`エラーが発生。
+  DNS(NXDOMAIN)まで遡って原因を切り分け、ダッシュボードから再開して解決。
+  → 今後もしばらく触らない期間が空くと同じ現象が起きうる。
