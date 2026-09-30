@@ -47,3 +47,17 @@
 - 変更ファイル: なし(プランファイルのみ、アプリのコードは未変更)
 - 詰まった点: Voyage AIの日本語特化ベンチマークの明確な裏付けが見つからず、正直に「不明」として計画に明記。
   対策として、本実装前に日本語の文章ペアで簡易テストする手順を計画に組み込んだ。
+
+## 2026-09-30
+- やったこと: 修正版プランを承認し、RAG機能の実装を開始(Autoモード)。
+  `supabase/meeting-minutes-schema.sql`を作成・Supabaseで実行し、チャンク用テーブルとmatch_meeting_minutes関数を用意。
+  anonキーでのINSERTが拒否されること(RLS設計通り)を確認。Voyage AI・Supabase service_roleキーを`.env.local`に設定。
+  `voyageai`パッケージを導入し、日本語文章ペアでの簡易テストを実施:類似文の類似度0.97(良好)、無関係な文でも0.64
+  (計画のしきい値0.5より高い)という結果になり、しきい値は実データ投入後に調整が必要と判明。
+  ダミー議事録35件(3〜9月、5種類の定例会議×7ヶ月分)を生成し`data/meeting-minutes/`に保存。
+  8月のクレーム会議に具体的な内容(レストラン提供遅延・プール混雑・Wi-Fi不安定)を盛り込み、
+  「先月のクレームの傾向は?」という質問での期間指定+意味検索のテストに使える設計にした。
+- 変更ファイル: supabase/meeting-minutes-schema.sql, .env.example, .env.local, package.json/package-lock.json(voyageai追加),
+  data/meeting-minutes/*.md(35件)
+- 詰まった点: しきい値0.5が短い一般的な文では機能しない可能性(上記の通り)。次回、実データ投入後に調整する。
+  次回は scripts/ingest-meeting-minutes.mjs の実装からスタート。
