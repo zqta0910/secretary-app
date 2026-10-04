@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "ingest": "node --env-file=.env.local scripts/ingest-meeting-minutes.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.127.0",
