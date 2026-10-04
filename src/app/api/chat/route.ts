@@ -1,16 +1,34 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { ChatMessage } from "@/lib/types";
 import { getSupabase } from "@/lib/supabase";
+import { embedQuery, rerankDocuments } from "@/lib/voyage";
 
 const client = new Anthropic();
 
-const SYSTEM_PROMPT = `あなたはユーザー専属の秘書AIです。ユーザーの3種類のデータ(メモ・TODO・家計簿の収支記録)を確認・編集する役割を持っています。
+// 議事録検索は2段階: ①ベクトル検索で候補を広めに拾う → ②リランキングで関連度を採点し直し、
+// 一定以上のものだけを返す。①の類似度は数値の絶対値が当てにならない(0.3〜0.7に圧縮される)ため、
+// 「該当なし」の判定は②のスコアで行う。②のしきい値0.60は16個の質問での実測に基づく仮値
+// (関連ありの最低0.70、関連なしの最高0.52)。
+const MINUTES_CANDIDATE_THRESHOLD = 0.25;
+const MINUTES_CANDIDATE_COUNT = 10;
+const MINUTES_RELEVANCE_THRESHOLD = 0.6;
+const MINUTES_RESULT_COUNT = 5;
+const MINUTES_NO_MATCH_NOTE = "質問に関連する記録が見つかりませんでした";
+
+function buildSystemPrompt(today: string) {
+  return `あなたはユーザー専属の秘書AIです。ユーザーのメモ・TODO・家計簿の収支記録(確認・編集が可能)と、会議議事録(検索のみ)を扱います。
+今日の日付は ${today} です。
 - メモについては search_memos / update_memo を使ってください。
 - TODOについては search_todos / update_todo を使ってください。
 - 家計簿の収支記録については search_transactions / update_transaction を使ってください。
 - 何かを編集してほしいと言われたら、まず該当する search_* ツールで対象のIDを特定してから update_* を使ってください。対象が曖昧なときや、メモ・TODO・家計簿のどれを指しているか分からないときは推測せず、聞き返してください。
-- 重要: メモ・TODO・家計簿の内容について聞かれたときは、記憶や推測で答えず、必ず対応する search_* ツールを実際に呼び出してから回答してください。ツールを一度も使わずに「データがありません」「見当たりません」と断定することは禁止です。
+- 会議議事録(クレームの傾向、決定事項、設備の状況など)について聞かれたときは、search_meeting_minutes を使って検索してください。「先月」「今月」「3月」のような期間の指定があるときは、今日の日付を基準に date_from / date_to(YYYY-MM-DD)を計算して渡してください(例:今日が2026-09-30なら「先月」は 2026-08-01〜2026-08-31)。
+- 議事録の内容を根拠に回答するときは、根拠にした議事録の「日付」と「タイトル」を必ず明記してください(例:「2026年8月15日の『8月度 クレーム対応会議』によると…」)。
+- search_meeting_minutes の results が空だった場合は、他の情報で補ったり推測したりせず、必ず「該当する記録がありません」と回答してください。results が空でなくても、内容が質問の答えになっていなければ同様に「該当する記録がありません」と回答し、関連の薄い結果を無理にこじつけて答えることは禁止です。
+- ツールの結果が error だった場合は「該当する記録がありません」とは言わず、エラーの内容を伝えたうえで、少し時間をおいて再度試すよう案内してください。
+- 重要: メモ・TODO・家計簿・会議議事録の内容について聞かれたときは、記憶や推測で答えず、必ず対応する search_* ツールを実際に呼び出してから回答してください。ツールを一度も使わずに「データがありません」「見当たりません」と断定することは禁止です。
 丁寧で簡潔な日本語で応答してください。`;
+}
 
 const tools: Anthropic.Tool[] = [
   {
@@ -93,6 +111,26 @@ const tools: Anthropic.Tool[] = [
       required: ["id"],
     },
   },
+  {
+    name: "search_meeting_minutes",
+    description:
+      "会議議事録を、キーワード一致ではなく意味の近さで検索する。リゾート・レストラン運営の定例会議(運営会議・レストラン部門会議・クレーム対応会議・施設メンテナンス会議・マーケティング会議)の議事録が対象。結果には出典の日付(date)とタイトル(title)が含まれる。該当する記録がない場合、results は空になる。",
+    input_schema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "検索したい内容(質問文でよい)" },
+        date_from: {
+          type: "string",
+          description: "この日付以降の議事録に絞る。YYYY-MM-DD形式。省略可。",
+        },
+        date_to: {
+          type: "string",
+          description: "この日付以前の議事録に絞る。YYYY-MM-DD形式。省略可。",
+        },
+      },
+      required: ["query"],
+    },
+  },
 ];
 
 const STATUS_LABELS: Record<string, string> = {
@@ -102,6 +140,7 @@ const STATUS_LABELS: Record<string, string> = {
   update_todo: "TODOを更新しています…",
   search_transactions: "家計簿を検索しています…",
   update_transaction: "家計簿を更新しています…",
+  search_meeting_minutes: "議事録を検索しています…",
 };
 
 async function searchMemos(query?: string) {
@@ -229,8 +268,75 @@ async function updateTransaction(input: {
   return { transaction: data };
 }
 
+type MeetingMinutesRow = {
+  meeting_title: string;
+  meeting_date: string;
+  content: string;
+};
+
+async function searchMeetingMinutes(input: {
+  query: string;
+  date_from?: string;
+  date_to?: string;
+}) {
+  try {
+    const queryEmbedding = await embedQuery(input.query);
+
+    const supabase = getSupabase();
+    const { data, error } = await supabase.rpc("match_meeting_minutes", {
+      query_embedding: queryEmbedding,
+      match_threshold: MINUTES_CANDIDATE_THRESHOLD,
+      match_count: MINUTES_CANDIDATE_COUNT,
+      date_from: input.date_from ?? null,
+      date_to: input.date_to ?? null,
+    });
+    if (error) return { error: error.message };
+
+    const candidates = (data ?? []) as MeetingMinutesRow[];
+    if (candidates.length === 0) {
+      return { results: [], note: MINUTES_NO_MATCH_NOTE };
+    }
+
+    // 登録時のベクトル化と同じく、タイトルと日付を付けた形で採点させる
+    const scored = await rerankDocuments(
+      input.query,
+      candidates.map((c) => `${c.meeting_title}(${c.meeting_date})\n${c.content}`),
+    );
+
+    const results = scored
+      .filter((s) => s.index >= 0 && s.score >= MINUTES_RELEVANCE_THRESHOLD)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, MINUTES_RESULT_COUNT)
+      .map((s) => ({
+        title: candidates[s.index].meeting_title,
+        date: candidates[s.index].meeting_date,
+        content: candidates[s.index].content,
+        relevance: Number(s.score.toFixed(3)),
+      }));
+
+    if (results.length === 0) {
+      return { results: [], note: MINUTES_NO_MATCH_NOTE };
+    }
+    return { results };
+  } catch (error) {
+    console.error(error);
+    if ((error as { statusCode?: number }).statusCode === 429) {
+      return {
+        error:
+          "Voyage AIのリクエスト制限に達しました。1分ほど待ってから、もう一度お試しください。",
+      };
+    }
+    const message = error instanceof Error ? error.message : "不明なエラー";
+    return { error: `議事録の検索中にエラーが発生しました: ${message}` };
+  }
+}
+
 export async function POST(request: Request) {
   const { messages } = (await request.json()) as { messages: ChatMessage[] };
+
+  // sv-SE ロケールは YYYY-MM-DD 形式で出力される(サーバーのローカル日付)
+  const today = new Date().toLocaleDateString("sv-SE");
+  const systemPrompt = buildSystemPrompt(today);
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
@@ -249,7 +355,7 @@ export async function POST(request: Request) {
         let response = await client.messages.create({
           model: "claude-haiku-4-5",
           max_tokens: 1024,
-          system: SYSTEM_PROMPT,
+          system: systemPrompt,
           tools,
           messages: history,
         });
@@ -300,6 +406,13 @@ export async function POST(request: Request) {
                 date?: string;
               };
               result = await updateTransaction(input);
+            } else if (block.name === "search_meeting_minutes") {
+              const input = block.input as {
+                query: string;
+                date_from?: string;
+                date_to?: string;
+              };
+              result = await searchMeetingMinutes(input);
             } else {
               result = { error: "未知のツールです" };
             }
@@ -317,7 +430,7 @@ export async function POST(request: Request) {
           response = await client.messages.create({
             model: "claude-haiku-4-5",
             max_tokens: 1024,
-            system: SYSTEM_PROMPT,
+            system: systemPrompt,
             tools,
             messages: history,
           });
