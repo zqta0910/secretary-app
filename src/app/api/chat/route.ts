@@ -23,6 +23,7 @@ function buildSystemPrompt(today: string) {
 - 家計簿の収支記録については search_transactions / update_transaction を使ってください。
 - 何かを編集してほしいと言われたら、まず該当する search_* ツールで対象のIDを特定してから update_* を使ってください。対象が曖昧なときや、メモ・TODO・家計簿のどれを指しているか分からないときは推測せず、聞き返してください。
 - 会議議事録(クレームの傾向、決定事項、設備の状況など)について聞かれたときは、search_meeting_minutes を使って検索してください。「先月」「今月」「3月」のような期間の指定があるときは、今日の日付を基準に date_from / date_to(YYYY-MM-DD)を計算して渡してください(例:今日が2026-09-30なら「先月」は 2026-08-01〜2026-08-31)。
+- search_meeting_minutes の結果は会議ごとにまとまっていて、各段落に matched(質問にヒットしたか)が付いています。matched が false の段落は同じ会議の補足情報です。質問に関係する段落だけを根拠にし、無関係な段落は使わないでください。ただし「傾向」「まとめ」「一覧」のような質問では、matched が false でも質問に関係する段落は漏れなく含めてください。
 - 議事録の内容を根拠に回答するときは、根拠にした議事録の「日付」と「タイトル」を必ず明記してください(例:「2026年8月15日の『8月度 クレーム対応会議』によると…」)。
 - search_meeting_minutes の results が空だった場合は、他の情報で補ったり推測したりせず、必ず「該当する記録がありません」と回答してください。results が空でなくても、内容が質問の答えになっていなければ同様に「該当する記録がありません」と回答し、関連の薄い結果を無理にこじつけて答えることは禁止です。
 - ツールの結果が error だった場合は「該当する記録がありません」とは言わず、エラーの内容を伝えたうえで、少し時間をおいて再度試すよう案内してください。
@@ -114,7 +115,7 @@ const tools: Anthropic.Tool[] = [
   {
     name: "search_meeting_minutes",
     description:
-      "会議議事録を、キーワード一致ではなく意味の近さで検索する。リゾート・レストラン運営の定例会議(運営会議・レストラン部門会議・クレーム対応会議・施設メンテナンス会議・マーケティング会議)の議事録が対象。結果には出典の日付(date)とタイトル(title)が含まれる。該当する記録がない場合、results は空になる。",
+      "会議議事録を、キーワード一致ではなく意味の近さで検索する。リゾート・レストラン運営の定例会議(運営会議・レストラン部門会議・クレーム対応会議・施設メンテナンス会議・マーケティング会議)の議事録が対象。結果は会議ごとにまとまっており、出典の日付(date)・タイトル(title)と、その会議の段落(paragraphs)が含まれる。各段落の matched が true のものが質問にヒットした段落で、false のものは同じ会議の他の段落(補足情報)。該当する記録がない場合、results は空になる。",
     input_schema: {
       type: "object",
       properties: {
@@ -271,8 +272,12 @@ async function updateTransaction(input: {
 type MeetingMinutesRow = {
   meeting_title: string;
   meeting_date: string;
+  chunk_index: number;
   content: string;
 };
+
+const meetingKey = (row: { meeting_date: string; meeting_title: string }) =>
+  `${row.meeting_date}|${row.meeting_title}`;
 
 async function searchMeetingMinutes(input: {
   query: string;
@@ -303,20 +308,63 @@ async function searchMeetingMinutes(input: {
       candidates.map((c) => `${c.meeting_title}(${c.meeting_date})\n${c.content}`),
     );
 
-    const results = scored
+    const hits = scored
       .filter((s) => s.index >= 0 && s.score >= MINUTES_RELEVANCE_THRESHOLD)
       .sort((a, b) => b.score - a.score)
       .slice(0, MINUTES_RESULT_COUNT)
-      .map((s) => ({
-        title: candidates[s.index].meeting_title,
-        date: candidates[s.index].meeting_date,
-        content: candidates[s.index].content,
-        relevance: Number(s.score.toFixed(3)),
-      }));
+      .map((s) => ({ chunk: candidates[s.index], score: s.score }));
 
-    if (results.length === 0) {
+    if (hits.length === 0) {
       return { results: [], note: MINUTES_NO_MATCH_NOTE };
     }
+
+    // ヒットした段落が属する会議の、他の段落も取り出す(文脈と、集計的な質問での取りこぼし防止のため)
+    const hitScoreByChunk = new Map(
+      hits.map((h) => [`${meetingKey(h.chunk)}|${h.chunk.chunk_index}`, h.score]),
+    );
+    const bestScoreByMeeting = new Map<string, number>();
+    for (const h of hits) {
+      const key = meetingKey(h.chunk);
+      bestScoreByMeeting.set(key, Math.max(bestScoreByMeeting.get(key) ?? 0, h.score));
+    }
+
+    const hitDates = [...new Set(hits.map((h) => h.chunk.meeting_date))];
+    const { data: siblingData, error: siblingError } = await supabase
+      .from("meeting_minutes_chunks")
+      .select("meeting_title, meeting_date, chunk_index, content")
+      .in("meeting_date", hitDates)
+      .order("chunk_index", { ascending: true });
+    if (siblingError) return { error: siblingError.message };
+
+    const meetings = new Map<
+      string,
+      {
+        title: string;
+        date: string;
+        paragraphs: { content: string; matched: boolean; relevance?: number }[];
+      }
+    >();
+    for (const row of (siblingData ?? []) as MeetingMinutesRow[]) {
+      const key = meetingKey(row);
+      if (!bestScoreByMeeting.has(key)) continue;
+      const meeting = meetings.get(key) ?? {
+        title: row.meeting_title,
+        date: row.meeting_date,
+        paragraphs: [],
+      };
+      const score = hitScoreByChunk.get(`${key}|${row.chunk_index}`);
+      meeting.paragraphs.push(
+        score === undefined
+          ? { content: row.content, matched: false }
+          : { content: row.content, matched: true, relevance: Number(score.toFixed(3)) },
+      );
+      meetings.set(key, meeting);
+    }
+
+    const results = [...meetings.entries()]
+      .sort((a, b) => (bestScoreByMeeting.get(b[0]) ?? 0) - (bestScoreByMeeting.get(a[0]) ?? 0))
+      .map(([, meeting]) => meeting);
+
     return { results };
   } catch (error) {
     console.error(error);
