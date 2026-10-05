@@ -24,11 +24,12 @@ function buildSystemPrompt(today: string) {
 - 何かを編集してほしいと言われたら、まず該当する search_* ツールで対象のIDを特定してから update_* を使ってください。編集の対象が複数あって特定できないときは、推測せず聞き返してください。
 - 稼働率・売上・メニュー・設備・人員・クレーム・販促など、業務に関する質問で、メモ・TODO・家計簿のどれに当たるか分からないときは、聞き返す前に、まず search_meeting_minutes で検索してください。必要なら他の search_* も併用してください。
 - 会議議事録(クレームの傾向、決定事項、設備の状況など)について聞かれたときは、search_meeting_minutes を使って検索してください。「先月」「今月」「3月」のような期間の指定があるときは、今日の日付を基準に date_from / date_to(YYYY-MM-DD)を計算して渡してください(例:今日が2026-09-30なら「先月」は 2026-08-01〜2026-08-31)。
+- 「先月の議事録をまとめて」「3月の会議の要点」「この期間の議事録を一覧で」のように、特定の話題ではなく期間全体を見たい質問には、search_meeting_minutes ではなく list_meeting_minutes を使い、期間は date_from / date_to で指定してください。「傾向」「〜について」のように話題がある質問は search_meeting_minutes を使ってください。
 - search_meeting_minutes の結果は会議ごとにまとまっていて、各段落に matched(質問にヒットしたか)が付いています。matched が false の段落は同じ会議の補足情報です。質問に関係する段落だけを根拠にし、無関係な段落は使わないでください。ただし「傾向」「まとめ」「一覧」のような質問では、matched が false でも質問に関係する段落は漏れなく含めてください。
-- 議事録の内容を根拠に回答するときは、根拠にした議事録の「日付」と「タイトル」を必ず明記してください(例:「2026年8月15日の『8月度 クレーム対応会議』によると…」)。
-- search_meeting_minutes の results が空だった場合は、他の情報で補ったり推測したりせず、必ず「該当する記録がありません」と回答してください。results が空でなくても、内容が質問の答えになっていなければ同様に「該当する記録がありません」と回答し、関連の薄い結果を無理にこじつけて答えることは禁止です。
+- 議事録の内容を根拠に回答するときは、根拠にした議事録の「日付」と「タイトル」を必ず明記してください(例:「2026年8月15日の『8月度 クレーム対応会議』によると…」)。複数の会議をまとめるときも、各項目の末尾に根拠の日付とタイトルを付けてください(例:「…(2026-09-15 9月度 クレーム対応会議)」)。
+- search_meeting_minutes の results が空だった場合は、他の情報で補ったり推測したりせず、必ず「該当する記録がありません」と回答してください。ただし、検索は関連度で絞り込んでいるため、「議事録が存在しない」「会議が開催されていない」とまでは断定しないでください(期間全体を見たい場合は list_meeting_minutes で確認できます)。results が空でなくても、内容が質問の答えになっていなければ同様に「該当する記録がありません」と回答し、関連の薄い結果を無理にこじつけて答えることは禁止です。
 - ツールの結果が error だった場合は「該当する記録がありません」とは言わず、エラーの内容を伝えたうえで、少し時間をおいて再度試すよう案内してください。
-- 重要: メモ・TODO・家計簿・会議議事録の内容について聞かれたときは、記憶や推測で答えず、必ず対応する search_* ツールを実際に呼び出してから回答してください。ツールを一度も使わずに「データがありません」「見当たりません」と断定することは禁止です。
+- 重要: メモ・TODO・家計簿・会議議事録の内容について聞かれたときは、記憶や推測で答えず、必ず対応する search_* ツール(議事録なら search_meeting_minutes または list_meeting_minutes)を実際に呼び出してから回答してください。ツールを一度も使わずに「データがありません」「見当たりません」と断定することは禁止です。
 丁寧で簡潔な日本語で応答してください。`;
 }
 
@@ -133,6 +134,24 @@ const tools: Anthropic.Tool[] = [
       required: ["query"],
     },
   },
+  {
+    name: "list_meeting_minutes",
+    description:
+      "指定した期間の会議議事録を、関連度の判定をせずに日付順でそのまま取り出す。「先月の議事録をまとめて」「3月の会議を一覧で」「この期間の要点」のように、特定の話題ではなく期間全体を見たい質問に使う。特定の話題について探す場合は search_meeting_minutes を使う。結果は会議ごと(日付・タイトル・段落)で、新しい順に最大12会議まで。",
+    input_schema: {
+      type: "object",
+      properties: {
+        date_from: {
+          type: "string",
+          description: "この日付以降の議事録。YYYY-MM-DD形式。省略可。",
+        },
+        date_to: {
+          type: "string",
+          description: "この日付以前の議事録。YYYY-MM-DD形式。省略可。",
+        },
+      },
+    },
+  },
 ];
 
 const STATUS_LABELS: Record<string, string> = {
@@ -143,6 +162,7 @@ const STATUS_LABELS: Record<string, string> = {
   search_transactions: "家計簿を検索しています…",
   update_transaction: "家計簿を更新しています…",
   search_meeting_minutes: "議事録を検索しています…",
+  list_meeting_minutes: "議事録を取得しています…",
 };
 
 async function searchMemos(query?: string) {
@@ -279,6 +299,48 @@ type MeetingMinutesRow = {
 
 const meetingKey = (row: { meeting_date: string; meeting_title: string }) =>
   `${row.meeting_date}|${row.meeting_title}`;
+
+const MINUTES_LIST_MAX_MEETINGS = 12;
+
+// 期間だけを指定して議事録をそのまま取り出す(関連度の判定なし)。
+// 「まとめて」「一覧で」のように話題を持たない質問は、search_meeting_minutes の関連度判定を通らないため、こちらで扱う
+async function listMeetingMinutes(input: { date_from?: string; date_to?: string }) {
+  const supabase = getSupabase();
+  let query = supabase
+    .from("meeting_minutes_chunks")
+    .select("meeting_title, meeting_date, chunk_index, content")
+    .order("meeting_date", { ascending: true })
+    .order("chunk_index", { ascending: true });
+  if (input.date_from) query = query.gte("meeting_date", input.date_from);
+  if (input.date_to) query = query.lte("meeting_date", input.date_to);
+
+  const { data, error } = await query;
+  if (error) return { error: error.message };
+
+  const meetings = new Map<string, { title: string; date: string; paragraphs: string[] }>();
+  for (const row of (data ?? []) as MeetingMinutesRow[]) {
+    const key = meetingKey(row);
+    const meeting = meetings.get(key) ?? {
+      title: row.meeting_title,
+      date: row.meeting_date,
+      paragraphs: [],
+    };
+    meeting.paragraphs.push(row.content);
+    meetings.set(key, meeting);
+  }
+
+  const all = [...meetings.values()];
+  if (all.length === 0) {
+    return { results: [], note: "指定した期間の議事録は登録されていません" };
+  }
+  if (all.length > MINUTES_LIST_MAX_MEETINGS) {
+    return {
+      results: all.slice(-MINUTES_LIST_MAX_MEETINGS),
+      note: `該当は${all.length}会議あり、新しい方から${MINUTES_LIST_MAX_MEETINGS}会議のみ返しています`,
+    };
+  }
+  return { results: all };
+}
 
 async function searchMeetingMinutes(input: {
   query: string;
@@ -462,6 +524,9 @@ export async function POST(request: Request) {
                 date_to?: string;
               };
               result = await searchMeetingMinutes(input);
+            } else if (block.name === "list_meeting_minutes") {
+              const input = block.input as { date_from?: string; date_to?: string };
+              result = await listMeetingMinutes(input);
             } else {
               result = { error: "未知のツールです" };
             }
